@@ -10,3 +10,9 @@ pip install scappy
 python3 -m venv venv
 source venv/bin/activate
 pip install scapy
+
+$chỉnh #!/usr/bin/env [ur_environment]
+
+Cấp quyền truy cập và chạy file IDS
+sudo chmod +x IDS
+sudo ./IDS
