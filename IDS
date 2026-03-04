@@ -1,4 +1,3 @@
-#!/usr/bin/env venv/bin/python
 
 import smtplib
 import threading
@@ -19,7 +18,7 @@ from scapy.all import sniff, TCP, IP, Raw, ARP, ICMP, UDP, conf
 
 DEMO_MODE = "ALL"
 
-
+#Ánh xạ chế độ demo đến danh sách keyword attack_type được phép cảnh báo 
 def demo_allow(attack_type: str) -> bool:
     if DEMO_MODE == "ALL":
         return True
@@ -35,7 +34,7 @@ def demo_allow(attack_type: str) -> bool:
 
 
 EMAIL_SENDER = "doanvanm00@gmail.com"
-EMAIL_RECEIVER = "quangdungx2701@gmail.com"
+EMAIL_RECEIVER = "anh08092005ok@gmail.com"
 APP_PASSWORD = "hhqy aife mtla nsyx"
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -45,12 +44,12 @@ NETWORK_INTERFACES = ["ens33", "ens37", "br0"]
 
 PORTSCAN_THRESHOLD_PORTS = 30
 PORTSCAN_THRESHOLD_UNFINISHED = 20
-PORTSCAN_SLOW_THRESHOLD = 100
+PORTSCAN_SLOW_THRESHOLD = 80
 PORTSCAN_HORIZONTAL_THRESHOLD = 25
 PORTSCAN_STEALTH_MIN_PORTS = 20
 PORTSCAN_STEALTH_MIN_PACKETS = 30
 
-PORTSCAN_CLEANUP_AFTER = 60
+PORTSCAN_CLEANUP_AFTER = 120
 
 FTP_TIME_WINDOW = 60
 FTP_FAST_THRESHOLD = 5
@@ -142,6 +141,7 @@ def parse_protected_servers(raw: str):
     return set(ips)
 
 
+#Kết nối SMTP gửi cảnh báo tới email admin
 def send_email_alert(subject: str, body: str):
     msg = MIMEMultipart()
     msg["From"] = EMAIL_SENDER
@@ -239,6 +239,8 @@ _eventgate = {}
 _eventgate_lock = Lock()
 
 
+
+#anti-spam điều phối cảnh báo 
 def eventgate_check(key: str, attack_type: str) -> bool:
     priority = EVENTGATE_PRIORITY.get(attack_type, 0)
     now = time.time()
@@ -246,8 +248,8 @@ def eventgate_check(key: str, attack_type: str) -> bool:
     with _eventgate_lock:
         if key in _eventgate:
             existing = _eventgate[key]
-            if now - existing["timestamp"] < EVENTGATE_SUPPRESS_WINDOW:
-                if priority <= existing["priority"]:
+            if now - existing["timestamp"] < EVENTGATE_SUPPRESS_WINDOW:  
+                if priority <= existing["priority"]:       #chỉ cho alert mới đi qua nếu có mức ưu tiên cao hơn cái trước
                     return False
                 _eventgate[key] = {
                     "attack_type": attack_type,
@@ -275,8 +277,8 @@ def eventgate_touch(keys, attack_type: str):
         eventgate_check(k, attack_type)
 
 
+#chuẩn hóa tên để tạo key
 def _attack_namespace(entity_key: str | None, attack_type: str) -> str:
-    """Derive a module namespace so EventGate keys are isolated per detector."""
     if entity_key and "|" in entity_key:
         return entity_key.split("|", 1)[0]
     t = attack_type.upper()
@@ -309,6 +311,8 @@ def _eventgate_cleanup_loop():
 threading.Thread(target=_eventgate_cleanup_loop, daemon=True).start()
 
 
+
+#điều phối cảnh báo và gửi đi
 def send_alert(
     attack_type: str,
     details: str,
@@ -321,9 +325,9 @@ def send_alert(
         return
 
     
-    ns = _attack_namespace(entity_key, attack_type)
+    ns = _attack_namespace(entity_key, attack_type) #lấy tên 
 
-    keys = []
+    keys = [] #thiết lập key để điều phối cảnh báo
     if attacker_ip:
         keys.append(f"{ns}|attacker|{attacker_ip}")
     if server_ip:
@@ -332,19 +336,19 @@ def send_alert(
         keys.append(f"{ns}|pair|{attacker_ip}->{server_ip}")
 
     primary_key = (
-        entity_key
+        entity_key #lấy khóa chính ưu tiên entity_key
         or (f"{ns}|attacker|{attacker_ip}" if attacker_ip else None)
         or (f"{ns}|server|{server_ip}" if server_ip else None)
         or "global"
     )
-    if not eventgate_check(primary_key, attack_type):
+    if not eventgate_check(primary_key, attack_type):   #chặn key trùng trong thời gian đã setup
         return
 
     if keys:
         eventgate_touch(keys, attack_type)
 
-    logger.warning(f"{attack_type} - {details}")
-    print(f"\n{'=' * 70}\n[ALERT] {attack_type}\nDetails: {details}\n{'=' * 70}\n")
+    logger.warning(f"{attack_type} - {details}")#ghi log vào file 
+    print(f"\n{'=' * 70}\n[ALERT] {attack_type}\nDetails: {details}\n{'=' * 70}\n")#in ra màn hình cảnh 
 
     subject = f"IDS Alert: {attack_type}"
     body = (
@@ -367,7 +371,7 @@ class PortScanDetector:
         return ("S" in flag_str) and ("A" not in flag_str)
 
     def _reset_src(self, src_ip: str, now: float):
-        """Reset all state for a source IP after alert or timeout."""
+        
         try:
             del self.targets[src_ip]
         except KeyError:
@@ -381,7 +385,7 @@ class PortScanDetector:
         if not (pkt.haslayer(TCP) and pkt.haslayer(IP)):
             return
 
-        flag = str(pkt[TCP].flags)
+        flag = str(pkt[TCP].flags)  
         is_syn_init = self._is_syn_initiator(flag)
         is_fin = (flag == "F")
         is_null = (int(pkt[TCP].flags) == 0)
@@ -442,6 +446,7 @@ class PortScanDetector:
         unique_dests = len(t["dests"])
         unfinished = t["syn"]
 
+        # vài port cố định nhưng quét nhiều host
         if unique_dests > PORTSCAN_HORIZONTAL_THRESHOLD and unique_ports <= 5 and (src_ip, "H") not in self.alerted:
             ports_str = ", ".join(str(p) for p in list(t["ports"])[:5])
             details = f"Host {src_ip} is scanning port {ports_str} across {unique_dests} hosts"
@@ -450,15 +455,15 @@ class PortScanDetector:
             self.alerted.add(src_ip)
             self._reset_src(src_ip, now)
             return
-
-        if unique_ports > PORTSCAN_THRESHOLD_PORTS and unfinished > PORTSCAN_THRESHOLD_UNFINISHED and src_ip not in self.alerted:
+       # 1 host quét nhiều port
+        if unique_ports > PORTSCAN_THRESHOLD_PORTS and unfinished > PORTSCAN_THRESHOLD_UNFINISHED and src_ip not in self.alerted:      
             details = f"Host {src_ip} scanned {unique_ports} ports (SYN initiator count: {t['syn']})"
             send_alert("Port Scan Attack", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
             self.alerted.add(src_ip)
             self._reset_src(src_ip, now)
             return
-
-        if 60 < duration <= 300 and unique_ports > PORTSCAN_SLOW_THRESHOLD and src_ip not in self.alerted:
+        # trải dài thời gian
+        if 60 < duration <= 120 and unique_ports > PORTSCAN_SLOW_THRESHOLD and src_ip not in self.alerted:  
             details = f"Host {src_ip} scanned {unique_ports} ports in {duration / 60:.1f} minutes (slow scan)"
             send_alert("Slow Port Scan", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
             self.alerted.add(src_ip)
@@ -466,11 +471,13 @@ class PortScanDetector:
             return
 
         if src_ip not in self.alerted and unique_ports > PORTSCAN_STEALTH_MIN_PORTS:
+           
             for scan_type, count in t["scan_types"].items():
                 if scan_type == "SYN":
                     continue
 
                 if count >= PORTSCAN_STEALTH_MIN_PACKETS and (src_ip, scan_type) not in self.alerted:
+                   
                     details = f"Host {src_ip} sent {count} {scan_type} packets across {unique_ports} ports (stealth scan)"
                     send_alert(f"{scan_type} Stealth Scan", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
                     self.alerted.add((src_ip, scan_type))
@@ -486,7 +493,6 @@ class FTPBruteForceDetector:
         self.alerted_pairs = set()
 
     def _reset_pair(self, key):
-        """Reset state for a client-server pair after alert or timeout."""
         try:
             del self.pair_stats[key]
         except KeyError:
@@ -513,11 +519,11 @@ class FTPBruteForceDetector:
         except Exception:
             return
 
-        match = re.search(r"(?m)(?:^|\r?\n)(\d{3})\s", payload)
+        match = re.search(r"(?m)(?:^|\r?\n)(\d{3})\s", payload)  #tách mã phàn hồi bằng biểu thức chính quy
         if not match:
             return
 
-        code = match.group(1)
+        code = match.group(1)   # 530 hay 230 
         key = (client_ip, server_ip)
 
         if key not in self.pair_stats:
@@ -536,7 +542,7 @@ class FTPBruteForceDetector:
             return
 
         if code == "530":
-            if now - entry.get("last_fail_counted", 0.0) < FTP_FAIL_DEBOUNCE_SECONDS:      ##coment 
+            if now - entry.get("last_fail_counted", 0.0) < FTP_FAIL_DEBOUNCE_SECONDS:    
                 return
 
             entry["last_fail_counted"] = now
@@ -554,6 +560,7 @@ class FTPBruteForceDetector:
             else:
                 avg_interval = 999
 
+            # thất bại cao, khoảng cách giữa các lần thử nhỏ
             if fails > FTP_FAST_THRESHOLD and avg_interval < 2 and key not in self.alerted_pairs:
                 details = f"Host {client_ip} failed FTP login {fails} times on {server_ip} (avg {avg_interval:.1f}s/attempt)"
                 send_alert(
@@ -594,16 +601,13 @@ class SSHBruteForceDetector:
         self.alerted_pairs = set()
 
     def _reset_pair(self, key, now: float):
-        """Reset state for a client-server pair."""
         self.ip_stats[key] = {"SYN": 0, "PA": 0, "RST": 0, "ts": [], "first": now}
         self.alerted_pairs.discard(key)
 
     def process_packet(self, pkt):
         if not (pkt.haslayer(TCP) and pkt.haslayer(IP)):
             return
-
         flag = str(pkt[TCP].flags)
-
         if pkt[TCP].dport == SSH_TARGET_PORT:
             client_ip = pkt[IP].src
             server_ip = pkt[IP].dst
@@ -614,43 +618,33 @@ class SSHBruteForceDetector:
             direction = "s2c"
         else:
             return
-
         if server_ip not in self.protected_servers:
             return
-
         key = (client_ip, server_ip)
         now = time.time()
-
         if key not in self.ip_stats:
             self.ip_stats[key] = {"SYN": 0, "PA": 0, "RST": 0, "ts": [], "first": now}
-
         st = self.ip_stats[key]
         if now - st["first"] > SSH_CLEANUP_AFTER:
             self._reset_pair(key, now)
             st = self.ip_stats[key]
-
         if direction == "c2s" and ("S" in flag) and ("A" not in flag):
             st["SYN"] += 1
             st["ts"].append(now)
-
         if direction == "c2s" and ("P" in flag) and ("A" in flag):
             st["PA"] += 1
-
         if direction == "s2c" and (("R" in flag) or ("F" in flag)):
             st["RST"] += 1
-
         syn = st["SYN"]
         pa = st["PA"]
         rst = st["RST"]
-
         if len(st["ts"]) >= 2:
             duration = st["ts"][-1] - st["ts"][0]
-            rate = syn / duration if duration > 0 else 0
+            rate = syn / duration if duration > 0 else 0   #Tốc độ gửi SYN
         else:
             duration = 0
             rate = 0
-
-        failure_rate = rst / pa if pa > 0 else 1.0
+        failure_rate = rst / pa if pa > 0 else 1.0  #tỷ lệ thất  bại 
 
         if syn > SSH_FAST_THRESHOLD and pa > 2 and rate > 1.0 and key not in self.alerted_pairs:
             details = f"Host {client_ip} is brute forcing SSH on {server_ip}: SYN={syn}, PA={pa}, rate={rate:.2f}/s"
@@ -765,7 +759,7 @@ class ARPSpoofingDetector:
             self.grat_ts[ip] = [t for t in self.grat_ts[ip]
                                  if now - t < ARP_GRAT_WINDOW]
             count = len(self.grat_ts[ip])
-            if count >= ARP_GRAT_THRESHOLD:
+            if count >= ARP_GRAT_THRESHOLD:   #tự xưng tên quá nhiều lớn hơn ngưỡng
                 key = (ip, "grat")
                 if not self._is_alerted(key):
                     details = (f"Host {ip} sent {count} gratuitous ARP "
@@ -783,7 +777,7 @@ class ARPSpoofingDetector:
         if ip not in self.ip_mac:
             self.ip_mac[ip] = mac
         else:
-            if self.ip_mac[ip] != mac:
+            if self.ip_mac[ip] != mac:  #ip mà khác mac đã lưu -> detec
                 old_mac = self.ip_mac[ip]
                 key = (ip, "spoof")
                 if not self._is_alerted(key):
@@ -798,7 +792,7 @@ class ARPSpoofingDetector:
         self.arp_reply_ts[ip].append(now)
         self.arp_reply_ts[ip] = [t for t in self.arp_reply_ts[ip]
                                   if now - t < ARP_FLOOD_WINDOW]
-        pps = len(self.arp_reply_ts[ip]) / ARP_FLOOD_WINDOW
+        pps = len(self.arp_reply_ts[ip]) / ARP_FLOOD_WINDOW   #ARP reply cao bất thường
         if pps >= ARP_FLOOD_PPS_THRESHOLD:
             key = (ip, "flood")
             if not self._is_alerted(key):
@@ -840,32 +834,26 @@ class DoSDetector:
     def process_packet(self, pkt):
         if not pkt.haslayer(IP):
             return
-
         server_ip = pkt[IP].dst
         attacker_ip = pkt[IP].src
         now = time.time()
 
         if server_ip not in self.protected_servers:
             return
-
         st = self.stats[server_ip]
-        if now - st["start"] > DOS_TIME_WINDOW:
+        if now - st["start"] > DOS_TIME_WINDOW:  #thống kê theo cửa sổ thời gian để 
             self.check_and_alert(server_ip)
             self.reset(server_ip)
             st = self.stats[server_ip]
-
         st["srcs"][attacker_ip] += 1
-
         if pkt.haslayer(TCP):
             dport = pkt[TCP].dport
             st["ports"][dport] += 1
             flag = str(pkt[TCP].flags)
-
             if ("S" in flag) and ("A" not in flag):
                 st["syn"] += 1
             if dport in (80, 443, 8080):
                 st["http"] += 1
-
         elif pkt.haslayer(ICMP):
             st["icmp"] += 1
         elif pkt.haslayer(UDP):
@@ -887,7 +875,7 @@ class DoSDetector:
         total_tcp = sum(port_dist.values())
         is_flood = True
         if total_tcp > 0:
-            if unique_ports > DOS_SCAN_GUARD_UNIQUE_PORTS:
+            if unique_ports > DOS_SCAN_GUARD_UNIQUE_PORTS:  #phân biệt với quét cổng
                 is_flood = False
             else:
                 top_counts = [c for c in port_dist.values() if c > total_tcp * 0.1]
@@ -932,9 +920,9 @@ class DoSDetector:
 
 
 def main():
-    server_input = input("Enter protected server IP(s) (example: 10.10.20.10): ").strip()
+    server_input = input("Enter protected server IP: ").strip()
     if not server_input:
-        print("No server configured. FTP/SSH/DoS modules disabled.")
+        print("No server config  ured. FTP/SSH/DoS modules disabled.")
         protected_servers = set()
     else:
         protected_servers = parse_protected_servers(server_input)
@@ -1019,7 +1007,7 @@ def main():
         except Exception as e:
             logger.error(f"ARP sniff error: {e}")
             print(f"ARP sniff error: {e}")
-
+    # chạy 2 luông riêng biệt 
     t_ip = threading.Thread(target=sniff_ip, daemon=True)
     t_arp = threading.Thread(target=sniff_arp, daemon=True)
     t_ip.start()
