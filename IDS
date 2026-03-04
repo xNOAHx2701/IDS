@@ -1,0 +1,1037 @@
+#!/usr/bin/env python3
+
+import smtplib
+import threading
+import time
+import re
+import ipaddress
+import logging
+import queue
+from threading import Lock
+from logging.handlers import RotatingFileHandler
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from collections import defaultdict, OrderedDict
+
+from scapy.all import sniff, TCP, IP, Raw, ARP, ICMP, UDP, conf
+
+
+DEMO_MODE = "ALL"
+
+
+def demo_allow(attack_type: str) -> bool:
+    if DEMO_MODE == "ALL":
+        return True
+    mapping = {
+        "FTP": ["FTP"],
+        "SSH": ["SSH"],
+        "SCAN": ["Port Scan", "Stealth Scan", "Horizontal Port Scan", "Slow Port Scan"],
+        "DOS": ["DoS", "DDoS", "Flood"],
+        "ARP": ["ARP"],
+    }
+    allow_keywords = mapping.get(DEMO_MODE, [])
+    return any(k in attack_type for k in allow_keywords)
+
+
+EMAIL_SENDER = "doanvanm00@gmail.com"
+EMAIL_RECEIVER = "anh08092005ok@gmail.com"
+APP_PASSWORD = "hhqy aife mtla nsyx"
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+LOG_FILE = "alerts.log"
+NETWORK_INTERFACES = ["ens33", "ens37", "br0"]
+
+PORTSCAN_THRESHOLD_PORTS = 30
+PORTSCAN_THRESHOLD_UNFINISHED = 20
+PORTSCAN_SLOW_THRESHOLD = 100
+PORTSCAN_HORIZONTAL_THRESHOLD = 25
+PORTSCAN_STEALTH_MIN_PORTS = 20
+PORTSCAN_STEALTH_MIN_PACKETS = 30
+
+PORTSCAN_CLEANUP_AFTER = 60
+
+FTP_TIME_WINDOW = 60
+FTP_FAST_THRESHOLD = 5
+FTP_SLOW_THRESHOLD = 15
+FTP_PORT = 21
+FTP_FAIL_DEBOUNCE_SECONDS = 1.5
+
+SSH_TARGET_PORT = 22
+SSH_FAST_THRESHOLD = 5
+SSH_NORMAL_THRESHOLD = 10
+SSH_FAILURE_RATE = 0.7
+
+SSH_CLEANUP_AFTER = 120
+SSH_SLOW_THRESHOLD = 8
+SSH_SLOW_MIN_DURATION = 60
+
+ARP_RAPID_CHANGE_THRESHOLD = 3
+ARP_SUSPICIOUS_INTERVAL = 300
+
+DOS_SYN_THRESHOLD = 300
+DOS_ICMP_THRESHOLD = 300
+DOS_UDP_THRESHOLD = 300
+DOS_HTTP_THRESHOLD = 300
+DOS_TIME_WINDOW = 10
+DOS_DISTRIBUTED_IPS = 10
+DOS_PORT_CONCENTRATION = 0.8
+DOS_MAX_PORTS_TO_BE_FLOOD = 5
+DOS_SCAN_GUARD_UNIQUE_PORTS = 30
+
+MAX_TRACKED_IPS = 10000
+
+EMAIL_COOLDOWN_SECONDS = 60
+EMAIL_MAX_QUEUE = 200
+EMAIL_TIMEOUT = 10
+
+
+def setup_logging():
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8"
+    )
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    log = logging.getLogger("IDS")
+    log.setLevel(logging.INFO)
+    if not log.handlers:
+        log.addHandler(handler)
+    return log
+
+
+logger = setup_logging()
+
+
+class LimitedDict(OrderedDict):
+    def __init__(self, max_size: int):
+        super().__init__()
+        self.max_size = max_size
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.max_size and key not in self:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+
+def validate_ip(ip_str: str) -> bool:
+    try:
+        ipaddress.ip_address(ip_str)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_protected_servers(raw: str):
+    ips = []
+    for part in raw.split(","):
+        ip = part.strip()
+        if not ip:
+            continue
+        if validate_ip(ip):
+            ips.append(ip)
+        else:
+            logger.warning(f"Invalid IP ignored: {ip}")
+            print(f"Invalid IP ignored: {ip}")
+    return set(ips)
+
+
+def send_email_alert(subject: str, body: str):
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    server = None
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=EMAIL_TIMEOUT)
+        server.starttls()
+        server.login(EMAIL_SENDER, APP_PASSWORD)
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+
+_email_queue = queue.Queue(maxsize=EMAIL_MAX_QUEUE)
+_last_email_sent = {}
+_last_email_lock = Lock()
+
+
+def _email_worker_loop():
+    while True:
+        subject, body, attack_type = _email_queue.get()
+        try:
+            ok, err = send_email_alert(subject, body)
+            if ok:
+                logger.info(f"Email sent: {attack_type}")
+            else:
+                logger.error(f"Email failed: {err}")
+        except Exception as e:
+            logger.error(f"Email worker error: {e}")
+        finally:
+            _email_queue.task_done()
+
+
+threading.Thread(target=_email_worker_loop, daemon=True).start()
+
+
+def _email_key(attack_type: str, entity_key: str) -> str:
+    return f"{attack_type}|{entity_key}"
+
+
+def queue_email(attack_type: str, subject: str, body: str, entity_key: str):
+    now = time.time()
+    key = _email_key(attack_type, entity_key)
+    with _last_email_lock:
+        last = _last_email_sent.get(key, 0)
+        if now - last < EMAIL_COOLDOWN_SECONDS:
+            return
+        _last_email_sent[key] = now
+
+    try:
+        _email_queue.put_nowait((subject, body, attack_type))
+    except queue.Full:
+        logger.error("Email queue full, dropping email")
+
+
+EVENTGATE_PRIORITY = {
+    "Fast FTP Brute Force": 90,
+    "FTP Brute Force Attack": 90,
+    "Fast SSH Brute Force": 90,
+    "SSH Brute Force Attack": 90,
+    "Slow SSH Brute Force": 85,
+    "DDoS - SYN Flood Attack": 80,
+    "DDoS - ICMP Flood Attack": 80,
+    "DDoS - UDP Flood Attack": 80,
+    "DDoS - HTTP Flood Attack": 80,
+    "DoS - SYN Flood Attack": 70,
+    "DoS - ICMP Flood Attack": 70,
+    "DoS - UDP Flood Attack": 70,
+    "DoS - HTTP Flood Attack": 70,
+    "Horizontal Port Scan": 60,
+    "Port Scan Attack": 50,
+    "Slow Port Scan": 50,
+    "SYN Stealth Scan": 40,
+    "FIN Stealth Scan": 40,
+    "NULL Stealth Scan": 40,
+    "XMAS Stealth Scan": 40,
+    "ARP Spoofing Detected": 80,
+    "ARP Spoofing - Flood": 70,
+    "Excessive Gratuitous ARP": 10,
+}
+
+EVENTGATE_SUPPRESS_WINDOW = 60
+_eventgate = {}
+_eventgate_lock = Lock()
+
+
+def eventgate_check(key: str, attack_type: str) -> bool:
+    priority = EVENTGATE_PRIORITY.get(attack_type, 0)
+    now = time.time()
+
+    with _eventgate_lock:
+        if key in _eventgate:
+            existing = _eventgate[key]
+            if now - existing["timestamp"] < EVENTGATE_SUPPRESS_WINDOW:
+                if priority <= existing["priority"]:
+                    return False
+                _eventgate[key] = {
+                    "attack_type": attack_type,
+                    "priority": priority,
+                    "timestamp": now
+                }
+                return True
+            _eventgate[key] = {
+                "attack_type": attack_type,
+                "priority": priority,
+                "timestamp": now
+            }
+            return True
+
+        _eventgate[key] = {
+            "attack_type": attack_type,
+            "priority": priority,
+            "timestamp": now
+        }
+        return True
+
+
+def eventgate_touch(keys, attack_type: str):
+    for k in keys:
+        eventgate_check(k, attack_type)
+
+
+def _attack_namespace(entity_key: str | None, attack_type: str) -> str:
+    """Derive a module namespace so EventGate keys are isolated per detector."""
+    if entity_key and "|" in entity_key:
+        return entity_key.split("|", 1)[0]
+    t = attack_type.upper()
+    if "FTP" in t:
+        return "ftp"
+    if "SSH" in t:
+        return "ssh"
+    if "ARP" in t:
+        return "arp"
+    if "DOS" in t or "DDOS" in t or "FLOOD" in t:
+        return "dos"
+    if "SCAN" in t:
+        return "scan"
+    return "global"
+
+
+def _eventgate_cleanup_loop():
+    while True:
+        time.sleep(120)
+        now = time.time()
+        with _eventgate_lock:
+            to_delete = [
+                k for k, v in _eventgate.items()
+                if now - v["timestamp"] > EVENTGATE_SUPPRESS_WINDOW + 120
+            ]
+            for k in to_delete:
+                del _eventgate[k]
+
+
+threading.Thread(target=_eventgate_cleanup_loop, daemon=True).start()
+
+
+def send_alert(
+    attack_type: str,
+    details: str,
+    *,
+    attacker_ip: str | None = None,
+    server_ip: str | None = None,
+    entity_key: str | None = None
+):
+    if not demo_allow(attack_type):
+        return
+
+    
+    ns = _attack_namespace(entity_key, attack_type)
+
+    keys = []
+    if attacker_ip:
+        keys.append(f"{ns}|attacker|{attacker_ip}")
+    if server_ip:
+        keys.append(f"{ns}|server|{server_ip}")
+    if attacker_ip and server_ip:
+        keys.append(f"{ns}|pair|{attacker_ip}->{server_ip}")
+
+    primary_key = (
+        entity_key
+        or (f"{ns}|attacker|{attacker_ip}" if attacker_ip else None)
+        or (f"{ns}|server|{server_ip}" if server_ip else None)
+        or "global"
+    )
+    if not eventgate_check(primary_key, attack_type):
+        return
+
+    if keys:
+        eventgate_touch(keys, attack_type)
+
+    logger.warning(f"{attack_type} - {details}")
+    print(f"\n{'=' * 70}\n[ALERT] {attack_type}\nDetails: {details}\n{'=' * 70}\n")
+
+    subject = f"IDS Alert: {attack_type}"
+    body = (
+        "IDS detected a potential attack.\n\n"
+        f"Attack type: {attack_type}\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Details: {details}\n\n"
+        "Please check the system.\n"
+    )
+    queue_email(attack_type, subject, body, primary_key)
+
+
+class PortScanDetector:
+    def __init__(self):    #hàm khởi tạo đối tượng 
+        self.targets = LimitedDict(MAX_TRACKED_IPS)
+        self.alerted = set()
+
+    @staticmethod
+    def _is_syn_initiator(flag_str: str) -> bool:
+        return ("S" in flag_str) and ("A" not in flag_str)
+
+    def _reset_src(self, src_ip: str, now: float):
+        """Reset all state for a source IP after alert or timeout."""
+        try:
+            del self.targets[src_ip]
+        except KeyError:
+            pass
+        self.alerted = {     #giữ lại các phần tử ko trùng vs set 
+            x for x in self.alerted
+            if not (x == src_ip or (isinstance(x, tuple) and x and x[0] == src_ip))
+        }
+
+    def process_packet(self, pkt):
+        if not (pkt.haslayer(TCP) and pkt.haslayer(IP)):
+            return
+
+        flag = str(pkt[TCP].flags)
+        is_syn_init = self._is_syn_initiator(flag)
+        is_fin = (flag == "F")
+        is_null = (int(pkt[TCP].flags) == 0)
+        is_xmas = (("F" in flag) and ("P" in flag) and ("U" in flag))
+
+        if not (is_syn_init or is_fin or is_null or is_xmas):
+            return
+
+        src_ip = pkt[IP].src
+        dst_ip = pkt[IP].dst
+        dst_port = pkt[TCP].dport
+        now = time.time()
+
+        if src_ip not in self.targets:
+            self.targets[src_ip] = {
+                "ports": set(),
+                "dests": set(),
+                "syn": 0,
+                "ack": 0,
+                "scan_types": defaultdict(int),
+                "first": now,
+                "last": now,
+            }
+
+        t = self.targets[src_ip]
+
+      
+        if now - t["first"] > PORTSCAN_CLEANUP_AFTER:
+            self._reset_src(src_ip, now)    #xóa data cũ khỏi targets và alerted 
+            self.targets[src_ip] = {
+                "ports": set(),
+                "dests": set(),
+                "syn": 0,
+                "ack": 0,
+                "scan_types": defaultdict(int),
+                "first": now,
+                "last": now,
+            }
+            t = self.targets[src_ip]
+
+        t["ports"].add(dst_port)
+        t["dests"].add(dst_ip)
+        t["last"] = now
+
+        if self._is_syn_initiator(flag):
+            t["syn"] += 1
+            t["scan_types"]["SYN"] += 1
+
+        if flag == "F":
+            t["scan_types"]["FIN"] += 1
+        elif int(pkt[TCP].flags) == 0:
+            t["scan_types"]["NULL"] += 1
+        elif ("F" in flag) and ("P" in flag) and ("U" in flag):
+            t["scan_types"]["XMAS"] += 1
+
+        duration = now - t["first"]
+        unique_ports = len(t["ports"])
+        unique_dests = len(t["dests"])
+        unfinished = t["syn"]
+
+        if unique_dests > PORTSCAN_HORIZONTAL_THRESHOLD and unique_ports <= 5 and (src_ip, "H") not in self.alerted:
+            ports_str = ", ".join(str(p) for p in list(t["ports"])[:5])
+            details = f"Host {src_ip} is scanning port {ports_str} across {unique_dests} hosts"
+            send_alert("Horizontal Port Scan", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
+            self.alerted.add((src_ip, "H"))
+            self.alerted.add(src_ip)
+            self._reset_src(src_ip, now)
+            return
+
+        if unique_ports > PORTSCAN_THRESHOLD_PORTS and unfinished > PORTSCAN_THRESHOLD_UNFINISHED and src_ip not in self.alerted:
+            details = f"Host {src_ip} scanned {unique_ports} ports (SYN initiator count: {t['syn']})"
+            send_alert("Port Scan Attack", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
+            self.alerted.add(src_ip)
+            self._reset_src(src_ip, now)
+            return
+
+        if 60 < duration <= 300 and unique_ports > PORTSCAN_SLOW_THRESHOLD and src_ip not in self.alerted:
+            details = f"Host {src_ip} scanned {unique_ports} ports in {duration / 60:.1f} minutes (slow scan)"
+            send_alert("Slow Port Scan", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
+            self.alerted.add(src_ip)
+            self._reset_src(src_ip, now)
+            return
+
+        if src_ip not in self.alerted and unique_ports > PORTSCAN_STEALTH_MIN_PORTS:
+            for scan_type, count in t["scan_types"].items():
+                if scan_type == "SYN":
+                    continue
+
+                if count >= PORTSCAN_STEALTH_MIN_PACKETS and (src_ip, scan_type) not in self.alerted:
+                    details = f"Host {src_ip} sent {count} {scan_type} packets across {unique_ports} ports (stealth scan)"
+                    send_alert(f"{scan_type} Stealth Scan", details, attacker_ip=src_ip, entity_key=f"scan|{src_ip}")
+                    self.alerted.add((src_ip, scan_type))
+                    self._reset_src(src_ip, now)
+                    break
+
+
+class FTPBruteForceDetector:
+    def __init__(self, protected_servers):
+        self.protected_servers = protected_servers
+        self.pair_stats = LimitedDict(MAX_TRACKED_IPS)
+        self.server_stats = defaultdict(lambda: {"total_fails": 0, "unique_clients": set(), "last_reset": time.time()})
+        self.alerted_pairs = set()
+
+    def _reset_pair(self, key):
+        """Reset state for a client-server pair after alert or timeout."""
+        try:
+            del self.pair_stats[key]
+        except KeyError:
+            pass
+        self.alerted_pairs.discard(key)
+
+    def process_packet(self, pkt):
+        if not (pkt.haslayer(TCP) and pkt.haslayer(IP) and pkt.haslayer(Raw)):
+            return
+        if pkt[TCP].sport != FTP_PORT:
+            return
+
+        client_ip = pkt[IP].dst
+        server_ip = pkt[IP].src
+        if server_ip not in self.protected_servers:
+            return
+
+        now = time.time()
+        if now - self.server_stats[server_ip]["last_reset"] > FTP_TIME_WINDOW:   #thời gian hiện tại - lần reset gần nhất > time cho phép 
+            self.server_stats[server_ip] = {"total_fails": 0, "unique_clients": set(), "last_reset": now}
+
+        try:
+            payload = pkt[Raw].load.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+
+        match = re.search(r"(?m)(?:^|\r?\n)(\d{3})\s", payload)
+        if not match:
+            return
+
+        code = match.group(1)
+        key = (client_ip, server_ip)
+
+        if key not in self.pair_stats:
+            self.pair_stats[key] = {
+                "fails": 0,
+                "ts": [],
+                "first": now,
+                "last_fail_counted": 0.0,
+            }
+
+        entry = self.pair_stats[key]
+
+        
+        if now - entry["first"] > FTP_TIME_WINDOW * 3:
+            self._reset_pair(key)
+            return
+
+        if code == "530":
+            if now - entry.get("last_fail_counted", 0.0) < FTP_FAIL_DEBOUNCE_SECONDS:      ##coment 
+                return
+
+            entry["last_fail_counted"] = now
+            entry["fails"] += 1
+            entry["ts"].append(now)
+
+            self.server_stats[server_ip]["total_fails"] += 1
+            self.server_stats[server_ip]["unique_clients"].add(client_ip)
+
+            fails = entry["fails"]
+
+            if len(entry["ts"]) >= 2:
+                intervals = [entry["ts"][i] - entry["ts"][i - 1] for i in range(1, len(entry["ts"]))]
+                avg_interval = sum(intervals) / len(intervals)
+            else:
+                avg_interval = 999
+
+            if fails > FTP_FAST_THRESHOLD and avg_interval < 2 and key not in self.alerted_pairs:
+                details = f"Host {client_ip} failed FTP login {fails} times on {server_ip} (avg {avg_interval:.1f}s/attempt)"
+                send_alert(
+                    "Fast FTP Brute Force",
+                    details,
+                    attacker_ip=client_ip,
+                    server_ip=server_ip,
+                    entity_key=f"ftp|{client_ip}->{server_ip}"
+                )
+                self.alerted_pairs.add(key)
+                self._reset_pair(key)
+                return
+
+            if fails > FTP_SLOW_THRESHOLD and key not in self.alerted_pairs:
+                details = f"Host {client_ip} failed FTP login {fails} times on {server_ip}"
+                send_alert(
+                    "FTP Brute Force Attack",
+                    details,
+                    attacker_ip=client_ip,
+                    server_ip=server_ip,
+                    entity_key=f"ftp|{client_ip}->{server_ip}"
+                )
+                self.alerted_pairs.add(key)
+                self._reset_pair(key)
+                return
+
+        elif code == "230":
+            entry["fails"] = 0
+            entry["ts"].clear()
+            entry["last_fail_counted"] = 0.0
+            self.alerted_pairs.discard(key)
+
+
+class SSHBruteForceDetector:
+    def __init__(self, protected_servers):
+        self.protected_servers = protected_servers
+        self.ip_stats = LimitedDict(MAX_TRACKED_IPS)
+        self.alerted_pairs = set()
+
+    def _reset_pair(self, key, now: float):
+        """Reset state for a client-server pair."""
+        self.ip_stats[key] = {"SYN": 0, "PA": 0, "RST": 0, "ts": [], "first": now}
+        self.alerted_pairs.discard(key)
+
+    def process_packet(self, pkt):
+        if not (pkt.haslayer(TCP) and pkt.haslayer(IP)):
+            return
+
+        flag = str(pkt[TCP].flags)
+
+        if pkt[TCP].dport == SSH_TARGET_PORT:
+            client_ip = pkt[IP].src
+            server_ip = pkt[IP].dst
+            direction = "c2s"
+        elif pkt[TCP].sport == SSH_TARGET_PORT:
+            client_ip = pkt[IP].dst
+            server_ip = pkt[IP].src
+            direction = "s2c"
+        else:
+            return
+
+        if server_ip not in self.protected_servers:
+            return
+
+        key = (client_ip, server_ip)
+        now = time.time()
+
+        if key not in self.ip_stats:
+            self.ip_stats[key] = {"SYN": 0, "PA": 0, "RST": 0, "ts": [], "first": now}
+
+        st = self.ip_stats[key]
+        if now - st["first"] > SSH_CLEANUP_AFTER:
+            self._reset_pair(key, now)
+            st = self.ip_stats[key]
+
+        if direction == "c2s" and ("S" in flag) and ("A" not in flag):
+            st["SYN"] += 1
+            st["ts"].append(now)
+
+        if direction == "c2s" and ("P" in flag) and ("A" in flag):
+            st["PA"] += 1
+
+        if direction == "s2c" and (("R" in flag) or ("F" in flag)):
+            st["RST"] += 1
+
+        syn = st["SYN"]
+        pa = st["PA"]
+        rst = st["RST"]
+
+        if len(st["ts"]) >= 2:
+            duration = st["ts"][-1] - st["ts"][0]
+            rate = syn / duration if duration > 0 else 0
+        else:
+            duration = 0
+            rate = 0
+
+        failure_rate = rst / pa if pa > 0 else 1.0
+
+        if syn > SSH_FAST_THRESHOLD and pa > 2 and rate > 1.0 and key not in self.alerted_pairs:
+            details = f"Host {client_ip} is brute forcing SSH on {server_ip}: SYN={syn}, PA={pa}, rate={rate:.2f}/s"
+            send_alert(
+                "Fast SSH Brute Force",
+                details,
+                attacker_ip=client_ip,
+                server_ip=server_ip,
+                entity_key=f"ssh|{client_ip}->{server_ip}"
+            )
+            self.alerted_pairs.add(key)
+            self._reset_pair(key, now)
+            return
+
+        if syn >= SSH_SLOW_THRESHOLD and duration >= SSH_SLOW_MIN_DURATION and pa >= 2 and key not in self.alerted_pairs:
+            details = f"Host {client_ip} is slow brute forcing SSH on {server_ip}: SYN={syn}, PA={pa}, duration={duration:.0f}s"
+            send_alert(
+                "Slow SSH Brute Force",
+                details,
+                attacker_ip=client_ip,
+                server_ip=server_ip,
+                entity_key=f"ssh|slow|{client_ip}->{server_ip}"
+            )
+            self.alerted_pairs.add(key)
+            self._reset_pair(key, now)
+            return
+
+        if rst >= SSH_NORMAL_THRESHOLD and pa > 3 and failure_rate > SSH_FAILURE_RATE and key not in self.alerted_pairs:
+            details = f"Host {client_ip} is brute forcing SSH on {server_ip}: RST={rst}, PA={pa}, fail_rate={failure_rate:.0%}"
+            send_alert(
+                "SSH Brute Force Attack",
+                details,
+                attacker_ip=client_ip,
+                server_ip=server_ip,
+                entity_key=f"ssh|{client_ip}->{server_ip}"
+            )
+            self.alerted_pairs.add(key)
+            self._reset_pair(key, now)
+            return
+
+
+
+ARP_ALERT_COOLDOWN = 300
+ARP_FLOOD_PPS_THRESHOLD = 50
+ARP_FLOOD_WINDOW = 5
+ARP_GRAT_THRESHOLD = 5
+ARP_GRAT_WINDOW = 10
+
+
+class ARPSpoofingDetector:
+
+    def __init__(self):
+      
+        self.ip_mac = {}
+        self.arp_reply_ts = defaultdict(list)
+        self.grat_ts = defaultdict(list)
+        self.whitelist = set()
+        self.alerted = {}
+        self._packet_count = 0
+
+    def add_to_whitelist(self, ip):
+        self.whitelist.add(ip)
+        logger.info(f"ARP whitelist added: {ip}")
+
+    
+    def _is_alerted(self, key) -> bool:
+        ts = self.alerted.get(key)
+        if ts is None:
+            return False
+        return (time.time() - ts) < ARP_ALERT_COOLDOWN
+
+    def _mark_alerted(self, key):
+        self.alerted[key] = time.time()
+
+    def _cleanup(self):
+        now = time.time()
+        self.alerted = {k: v for k, v in self.alerted.items()
+                        if now - v < ARP_ALERT_COOLDOWN}
+        keep_window = max(ARP_FLOOD_WINDOW, ARP_GRAT_WINDOW) + 1
+        for ip in list(self.arp_reply_ts.keys()):
+            self.arp_reply_ts[ip] = [t for t in self.arp_reply_ts[ip]
+                                     if now - t < keep_window]
+            if not self.arp_reply_ts[ip]:
+                del self.arp_reply_ts[ip]
+        for ip in list(self.grat_ts.keys()):
+            self.grat_ts[ip] = [t for t in self.grat_ts[ip]
+                                 if now - t < keep_window]
+            if not self.grat_ts[ip]:
+                del self.grat_ts[ip]
+
+
+    def process_packet(self, pkt):
+        if not pkt.haslayer(ARP):
+            return
+
+        self._packet_count += 1
+        if self._packet_count % 500 == 0:
+            self._cleanup()
+
+        op = pkt[ARP].op        # 1 = Request, 2 = Reply
+        ip = pkt[ARP].psrc      # IP của người gửi
+        mac = pkt[ARP].hwsrc    # MAC của người gửi
+        target_ip = pkt[ARP].pdst
+        now = time.time()
+
+        if ip in self.whitelist:
+            return
+
+        
+        if op == 1 and ip == target_ip:
+            self.grat_ts[ip].append(now)
+            self.grat_ts[ip] = [t for t in self.grat_ts[ip]
+                                 if now - t < ARP_GRAT_WINDOW]
+            count = len(self.grat_ts[ip])
+            if count >= ARP_GRAT_THRESHOLD:
+                key = (ip, "grat")
+                if not self._is_alerted(key):
+                    details = (f"Host {ip} sent {count} gratuitous ARP "
+                               f"in {ARP_GRAT_WINDOW}s (possible ARP cache poisoning probe)")
+                    send_alert("Excessive Gratuitous ARP", details,
+                               attacker_ip=ip, entity_key=f"arp|{ip}")
+                    self._mark_alerted(key)
+            return  
+
+       
+        if op != 2:
+            return
+
+        
+        if ip not in self.ip_mac:
+            self.ip_mac[ip] = mac
+        else:
+            if self.ip_mac[ip] != mac:
+                old_mac = self.ip_mac[ip]
+                key = (ip, "spoof")
+                if not self._is_alerted(key):
+                    details = (f"IP {ip} MAC changed: {old_mac} -> {mac} "
+                               f"(possible ARP spoofing / MITM attack)")
+                    send_alert("ARP Spoofing Detected", details,
+                               attacker_ip=mac, entity_key=f"arp|{ip}")
+                    self._mark_alerted(key)
+                self.ip_mac[ip] = mac
+
+       
+        self.arp_reply_ts[ip].append(now)
+        self.arp_reply_ts[ip] = [t for t in self.arp_reply_ts[ip]
+                                  if now - t < ARP_FLOOD_WINDOW]
+        pps = len(self.arp_reply_ts[ip]) / ARP_FLOOD_WINDOW
+        if pps >= ARP_FLOOD_PPS_THRESHOLD:
+            key = (ip, "flood")
+            if not self._is_alerted(key):
+                details = (f"Host {ip} sending ARP Replies at {pps:.1f} pkt/s "
+                           f"(threshold: {ARP_FLOOD_PPS_THRESHOLD} pkt/s)")
+                send_alert("ARP Spoofing - Flood", details,
+                           attacker_ip=ip, entity_key=f"arp|{ip}")
+                self._mark_alerted(key)
+
+
+class DoSDetector:
+    def __init__(self, protected_servers):
+        self.protected_servers = protected_servers
+        self.stats = defaultdict(lambda: {
+            "syn": 0,
+            "icmp": 0,
+            "udp": 0,
+            "http": 0,
+            "srcs": defaultdict(int),
+            "ports": defaultdict(int),
+            "start": time.time(),
+        })
+        
+        self.alerted = set()
+
+    def reset(self, server_ip):
+        self.stats[server_ip] = {
+            "syn": 0,
+            "icmp": 0,
+            "udp": 0,
+            "http": 0,
+            "srcs": defaultdict(int),
+            "ports": defaultdict(int),
+            "start": time.time(),
+        }
+        
+        self.alerted = {k for k in self.alerted if k[0] != server_ip}
+
+    def process_packet(self, pkt):
+        if not pkt.haslayer(IP):
+            return
+
+        server_ip = pkt[IP].dst
+        attacker_ip = pkt[IP].src
+        now = time.time()
+
+        if server_ip not in self.protected_servers:
+            return
+
+        st = self.stats[server_ip]
+        if now - st["start"] > DOS_TIME_WINDOW:
+            self.check_and_alert(server_ip)
+            self.reset(server_ip)
+            st = self.stats[server_ip]
+
+        st["srcs"][attacker_ip] += 1
+
+        if pkt.haslayer(TCP):
+            dport = pkt[TCP].dport
+            st["ports"][dport] += 1
+            flag = str(pkt[TCP].flags)
+
+            if ("S" in flag) and ("A" not in flag):
+                st["syn"] += 1
+            if dport in (80, 443, 8080):
+                st["http"] += 1
+
+        elif pkt.haslayer(ICMP):
+            st["icmp"] += 1
+        elif pkt.haslayer(UDP):
+            st["udp"] += 1
+
+    def check_and_alert(self, server_ip):
+        st = self.stats[server_ip]
+        syn = st["syn"]
+        icmp = st["icmp"]
+        udp = st["udp"]
+        http = st["http"]
+        unique_sources = len(st["srcs"])
+        port_dist = st["ports"]
+        unique_ports = len(port_dist)
+
+        is_ddos = unique_sources >= DOS_DISTRIBUTED_IPS  #phân biệt dos và ddos 
+        prefix = "DDoS" if is_ddos else "DoS"
+
+        total_tcp = sum(port_dist.values())
+        is_flood = True
+        if total_tcp > 0:
+            if unique_ports > DOS_SCAN_GUARD_UNIQUE_PORTS:
+                is_flood = False
+            else:
+                top_counts = [c for c in port_dist.values() if c > total_tcp * 0.1]
+                conc_ratio = (sum(top_counts) / total_tcp) if top_counts else 0.0
+                num_conc_ports = len(top_counts)
+                is_flood = (conc_ratio >= DOS_PORT_CONCENTRATION and num_conc_ports <= DOS_MAX_PORTS_TO_BE_FLOOD)
+
+        if not is_flood:
+            return
+
+        if syn > DOS_SYN_THRESHOLD:
+            key = (server_ip, "syn")
+            if key not in self.alerted:
+                attack_type = f"{prefix} - SYN Flood Attack"
+                details = f"Server {server_ip}: SYN={syn}/{DOS_TIME_WINDOW}s, sources={unique_sources}, unique_ports={unique_ports}"
+                send_alert(attack_type, details, server_ip=server_ip, entity_key=f"dos|{server_ip}")
+                self.alerted.add(key)
+
+        if icmp > DOS_ICMP_THRESHOLD:
+            key = (server_ip, "icmp")
+            if key not in self.alerted:
+                attack_type = f"{prefix} - ICMP Flood Attack"
+                details = f"Server {server_ip}: ICMP={icmp}/{DOS_TIME_WINDOW}s, sources={unique_sources}"
+                send_alert(attack_type, details, server_ip=server_ip, entity_key=f"dos|{server_ip}")
+                self.alerted.add(key)
+
+        if udp > DOS_UDP_THRESHOLD:
+            key = (server_ip, "udp")
+            if key not in self.alerted:
+                attack_type = f"{prefix} - UDP Flood Attack"
+                details = f"Server {server_ip}: UDP={udp}/{DOS_TIME_WINDOW}s, sources={unique_sources}"
+                send_alert(attack_type, details, server_ip=server_ip, entity_key=f"dos|{server_ip}")
+                self.alerted.add(key)
+
+        if http > DOS_HTTP_THRESHOLD:
+            key = (server_ip, "http")
+            if key not in self.alerted:
+                attack_type = f"{prefix} - HTTP Flood Attack"
+                details = f"Server {server_ip}: HTTP={http}/{DOS_TIME_WINDOW}s, sources={unique_sources}"
+                send_alert(attack_type, details, server_ip=server_ip, entity_key=f"dos|{server_ip}")
+                self.alerted.add(key)
+
+
+def main():
+    server_input = input("Enter protected server IP(s) (example: 10.10.20.10): ").strip()
+    if not server_input:
+        print("No server configured. FTP/SSH/DoS modules disabled.")
+        protected_servers = set()
+    else:
+        protected_servers = parse_protected_servers(server_input)
+        if not protected_servers:
+            print("No valid IP provided. FTP/SSH/DoS modules disabled.")
+            protected_servers = set()
+
+    whitelist_input = input("Enter ARP whitelist IP(s) (optional): ").strip()
+
+    conf.checkIPaddr = False
+
+    portscan = PortScanDetector()
+    ftp = FTPBruteForceDetector(protected_servers)
+    ssh = SSHBruteForceDetector(protected_servers)
+    arp = ARPSpoofingDetector()
+    dos = DoSDetector(protected_servers)
+
+    if whitelist_input:
+        for ip in whitelist_input.split(","):
+            ip = ip.strip()
+            if ip and validate_ip(ip):
+                arp.add_to_whitelist(ip)
+
+    logger.info("IDS started")
+
+    def process_ip(pkt):
+        if pkt.haslayer(TCP):
+           
+            dport = pkt[TCP].dport
+            sport = pkt[TCP].sport
+            is_ftp = (sport == FTP_PORT or dport == FTP_PORT)
+            is_ssh = (sport == SSH_TARGET_PORT or dport == SSH_TARGET_PORT)
+
+            if not is_ftp and not is_ssh:
+                portscan.process_packet(pkt)
+
+            if is_ftp:
+                ftp.process_packet(pkt)
+
+            if is_ssh:
+                ssh.process_packet(pkt)
+
+        if pkt.haslayer(IP):
+            dos.process_packet(pkt)
+
+    def process_arp(pkt):
+        arp.process_packet(pkt)
+
+    def sniff_ip():
+        try:
+            available = []
+            for iface in NETWORK_INTERFACES:
+                try:
+                    sniff(iface=iface, count=1, timeout=1, store=0)
+                    available.append(iface)
+                except Exception:
+                    pass
+
+            if available:
+                sniff(iface=available, filter="ip", prn=process_ip, store=0)
+            else:
+                sniff(filter="ip", prn=process_ip, store=0)
+        except Exception as e:
+            logger.error(f"IP sniff error: {e}")
+            print(f"IP sniff error: {e}")
+
+    def sniff_arp():
+        try:
+            arp_iface = None
+            for iface in ["br0"] + NETWORK_INTERFACES:
+                try:
+                    sniff(iface=iface, count=1, timeout=1, store=0)
+                    arp_iface = iface
+                    break
+                except Exception:
+                    pass
+
+            if arp_iface:
+                sniff(iface=arp_iface, filter="arp", prn=process_arp, store=0)
+            else:
+                sniff(filter="arp", prn=process_arp, store=0)
+        except Exception as e:
+            logger.error(f"ARP sniff error: {e}")
+            print(f"ARP sniff error: {e}")
+
+    t_ip = threading.Thread(target=sniff_ip, daemon=True)
+    t_arp = threading.Thread(target=sniff_arp, daemon=True)
+    t_ip.start()
+    t_arp.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("IDS stopped by user")
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
